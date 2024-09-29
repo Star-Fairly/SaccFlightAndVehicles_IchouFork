@@ -50,13 +50,13 @@ namespace SaccFlightAndVehicles
         public Transform SyncTransform_Raw;
         private Transform VehicleTransform;
         private double nextUpdateTime = double.MaxValue;
-        [UdonSynced] private double O_UpdateTime;
-        [UdonSynced] private Vector3 O_Position;
-        [UdonSynced] private short O_RotationW;
-        [UdonSynced] private short O_RotationX;
-        [UdonSynced] private short O_RotationY;
-        [UdonSynced] private short O_RotationZ;
-        [UdonSynced] private Vector3 O_CurVel = Vector3.zero;
+        /*[UdonSynced]*/ private double O_UpdateTime;
+        /*[UdonSynced]*/ private Vector3 O_Position;
+        /*[UdonSynced]*/ private short O_RotationW;
+        /*[UdonSynced]*/ private short O_RotationX;
+        /*[UdonSynced]*/ private short O_RotationY;
+        /*[UdonSynced]*/ private short O_RotationZ;
+        /*[UdonSynced]*/ private Vector3 O_CurVel = Vector3.zero;
         private Vector3 O_CurVelLast = Vector3.zero;
         private Vector3 O_Rotation;
         private Quaternion O_Rotation_Q = Quaternion.identity;
@@ -72,6 +72,8 @@ namespace SaccFlightAndVehicles
         private bool IsOwner = true;
         private Vector3 ExtrapolationDirection;
         private Quaternion RotationExtrapolationDirection;
+        private Vector3 L_PingAdjustedPosition = Vector3.zero;
+        private Quaternion L_PingAdjustedRotation = Quaternion.identity;
         private Vector3 lerpedCurVel;
         private Vector3 Acceleration = Vector3.zero;
         private Vector3 LastAcceleration;
@@ -95,6 +97,7 @@ namespace SaccFlightAndVehicles
         private double StartupLocalTime;
         private Vector3 ExtrapDirection_Smooth;
         private Quaternion RotExtrapDirection_Smooth;
+        // private Quaternion RotExtrapDirection_Smooth_Correction;
 #if UNITY_EDITOR
         private bool TestMode;
 #endif
@@ -188,7 +191,7 @@ namespace SaccFlightAndVehicles
         private void InitSyncValues()
         {
             ResetSyncTimes();
-            Extrapolation_Raw = O_Position = VehicleTransform.position;
+            Extrapolation_Raw = L_PingAdjustedPosition = O_Position = VehicleTransform.position;
             O_LastRotation = O_Rotation_Q = VehicleTransform.rotation;
             nextUpdateTime = StartupServerTime + (double)(Time.time - StartupLocalTime + Random.Range(0f, updateInterval));
             O_LastUpdateTime = L_UpdateTime = lastframetime = lastframetime_extrap = Networking.GetServerTimeInMilliseconds();
@@ -210,9 +213,6 @@ namespace SaccFlightAndVehicles
             IsOwner = true;
             VehicleRigid.isKinematic = false;
             VehicleRigid.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
-            Vector3 cvel = (Vector3)SAVControl.GetProgramVariable("CurrentVel");
-            VehicleRigid.velocity = cvel;
-            SAVControl.SetProgramVariable("LastFrameVel", cvel);
             if (ObjectMode)
             {
                 VehicleRigid.drag = StartDrag;
@@ -230,7 +230,8 @@ namespace SaccFlightAndVehicles
             IsOwner = false;
             O_LastUpdateTime = L_UpdateTime = lastframetime_extrap = StartupServerTime + (double)(Time.time - StartupLocalTime);
             O_LastUpdateTime -= updateInterval;
-            Extrapolation_Raw = O_Position;
+            IsOwner = false;
+            Extrapolation_Raw = L_PingAdjustedPosition = O_Position;
             ExtrapDirection_Smooth = O_CurVel;
             RotExtrapolation_Raw = RotationLerper = O_LastRotation = O_Rotation_Q;
             LastCurAngMom = CurAngMom = Quaternion.identity;
@@ -265,41 +266,24 @@ namespace SaccFlightAndVehicles
             UpdatesSentWhileStill = 0;
             //make it teleport instead of interpolating
             ExtrapolationDirection = Vector3.zero;
-            Extrapolation_Raw = O_LastPosition = O_Position;
-            RotationLerper = O_LastRotation = O_Rotation_Q;
-            if (!IsOwner)
-            {
-                VehicleTransform.position = O_Position;
-                VehicleTransform.rotation = O_Rotation_Q;
-            }
+            Extrapolation_Raw = VehicleTransform.position = L_PingAdjustedPosition = O_LastPosition = O_Position;
+            RotationLerper = VehicleTransform.rotation = O_LastRotation = O_Rotation_Q;
             ExtrapDirection_Smooth = Vector3.zero;
             RotExtrapDirection_Smooth = Quaternion.identity;
             L_CurVelLast = Vector3.zero;
             LastAcceleration = Acceleration = Vector3.zero;
         }
-        float lastFrameTime_hitchtest;
-        private void Update()
+        /*private void Update()
         {
             if (IsOwner)//send data
             {
-                //uncomment to test hitching
-                // int i = 0;
-                // if (Input.GetKeyDown(KeyCode.V))
-                // {
-                //     while (Time.realtimeSinceStartup - lastFrameTime_hitchtest < 1f)
-                //     {
-                //         i++;
-                //     }
-                // }
-                // lastFrameTime_hitchtest = Time.realtimeSinceStartup;
                 double time = (StartupServerTime + (double)(Time.time - StartupLocalTime));
                 if (Time.deltaTime > .099f)
                 {
                     ResetSyncTimes();
                     time = Networking.GetServerTimeInSeconds();//because we just ResetSyncTimes()'d
-                    if (_AntiWarp && !DisableAntiWarp)//let's see if we can fix the movement jerkiness for observers if the FPS is extremely low
+                    if (_AntiWarp)//let's see if we can fix the movement jerkiness for observers if the FPS is extremely low
                     {
-                        // ANTIWARP DOES NOT WORK IN CLIENTSIM, TEST IN-GAME
                         double acctime = time;
                         double accuratedelta = acctime - lastframetime;
                         Vector3 RigidMovedAmount = VehicleRigid.velocity * Time.deltaTime;
@@ -307,18 +291,14 @@ namespace SaccFlightAndVehicles
 
                         if (DistanceTravelled < (VehicleRigid.velocity * (float)accuratedelta).magnitude)
                         {
-                            if (!Physics.Raycast(VehicleRigid.position, VehicleRigid.velocity, ((VehicleRigid.velocity * (float)accuratedelta) - RigidMovedAmount).magnitude, 133121 /* Default, Environment, and Walkthrough */, QueryTriggerInteraction.Ignore))
-                            {
-                                //smooth, but the extrapolation gets added each time (i think) causing vehicle to be faster (10%~)
-                                //VehicleTransform.position += (VehicleRigid.velocity * (float)accuratedelta) - RigidMovedAmount;
-                                //it's more correct to use RB position, but then you're removing the RB extrapolation and things get jerky.
-                                //When setting rigidbody position, although it looks more jerky when flying side-by-side, it's more accurate speed-wise
-                                //and hopefully doesn't cause rapid speed-up-slow-down if you keep on transitioning in and out of the parent if statement.
-                                //Setting transform position to rigidbody position+, so that position is correct if data is sent this frame (the result should be the jerky, speed-accurate one)
-                                VehicleTransform.position = VehicleRigid.position + (VehicleRigid.velocity * (float)accuratedelta) - RigidMovedAmount;
-                                VehicleRigid.position = VehicleTransform.position;
-                                //is there a best of both worlds solution?
-                            }
+                            //smooth, but the extrapolation gets added each time (i think) causing vehicle to be faster (10%~)
+                            //VehicleTransform.position += (VehicleRigid.velocity * (float)accuratedelta) - RigidMovedAmount;
+                            //it's more correct to use RB position, but then you're removing the RB extrapolation and things get jerky.
+                            //When setting rigidbody position, although it looks more jerky when flying side-by-side, it's more accurate speed-wise
+                            //and hopefully doesn't cause rapid speed-up-slow-down if you keep on transitioning in and out of the parent if statement.
+                            //Setting transform position to rigidbody position+, so that position is correct if data is sent this frame (the result should be the jerky, speed-accurate one)
+                            VehicleTransform.position = VehicleRigid.position + (VehicleRigid.velocity * (float)accuratedelta) - RigidMovedAmount;
+                            //is there a best of both worlds solution?
                         }
                     }
                 }
@@ -372,13 +352,11 @@ namespace SaccFlightAndVehicles
         }
         private void ExtrapolationAndSmoothing()
         {
-#if UNITY_EDITOR
             if (Deserialized)
             {
                 Deserialized = false;
-                OnDeserialization();
+                DeserializationStuff();
             }
-#endif
             float deltatime = Time.deltaTime;
             double time;
             Vector3 Deriv = Vector3.zero;
@@ -398,7 +376,8 @@ namespace SaccFlightAndVehicles
             }
             ErrorLastFrame = Error;
             lastframetime_extrap = Networking.GetServerTimeInSeconds();
-            float TimeSinceUpdate = (float)((time - L_UpdateTime) / updateInterval);
+            float TimeSinceUpdate = (float)(time - L_UpdateTime)
+                    / updateInterval;
             //extrapolated position based on time passed since update
             Vector3 VelEstimate = L_CurVel + (Acceleration * TimeSinceUpdate);
             ExtrapDirection_Smooth = Vector3.Lerp(ExtrapDirection_Smooth, VelEstimate + Correction + Deriv, SpeedLerpTime * deltatime);
@@ -409,7 +388,7 @@ namespace SaccFlightAndVehicles
             RotExtrapDirection_Smooth = RealSlerp(RotExtrapDirection_Smooth, AngMomEstimate, RotationSpeedLerpTime * deltatime);
 
             //apply positional update
-            Extrapolation_Raw = O_Position + (ExtrapolationDirection * (float)(time - O_UpdateTime));
+            Extrapolation_Raw += ExtrapolationDirection * deltatime;
             SyncTransform.position += ExtrapDirection_Smooth * deltatime;
             //apply rotational update
             Quaternion FrameRotExtrap = RealSlerp(Quaternion.identity, RotationExtrapolationDirection, deltatime);
@@ -425,13 +404,19 @@ namespace SaccFlightAndVehicles
                 SyncTransform_Raw.rotation = RotExtrapolation_Raw;
             }
 #endif
-        }
+        }*/
         private void EnterIdleMode()
         { IdleUpdateMode = true; }
         private void ExitIdleMode()
         { IdleUpdateMode = false; }
+        public override void OnDeserialization()
+        {
+            if (!IsOwner)//only do anything if OnDeserialization was for this script
+            {
+                DeserializationCheck();
+            }
+        }
 #if UNITY_EDITOR
-        [Tooltip("Doesn't work properly, can't wait beyond update interval.")]
         public float LagSimDelay;
         private float LagSimTime;
         private bool LagSimWait;
@@ -441,11 +426,13 @@ namespace SaccFlightAndVehicles
             if (TestMode)
             { DeserializationCheck(); }
         }
+#endif
         private bool Deserialized = false;
         private void DeserializationCheck()
         {
-            if (O_UpdateTime != O_LastUpdateTime)
+            if (O_UpdateTime != O_LastUpdateTime)//only do anything if OnDeserialization was for this script
             {
+#if UNITY_EDITOR
                 if (!LagSimWait)
                 {
                     if (LagSimDelay != 0)
@@ -466,11 +453,11 @@ namespace SaccFlightAndVehicles
                         return;
                     }
                 }
+#endif
                 Deserialized = true;
             }
         }
-#endif
-        public override void OnDeserialization()
+        public void DeserializationStuff()
         {
             LastAcceleration = Acceleration;
             LastCurAngMom = CurAngMom;
@@ -497,10 +484,10 @@ namespace SaccFlightAndVehicles
             else
             { L_CurVel = O_CurVel; }
             O_CurVelLast = O_CurVel;
-            Acceleration = L_CurVel - L_CurVelLast;//acceleration is difference in velocity
+            Acceleration = (L_CurVel - L_CurVelLast);//acceleration is difference in velocity
 
             float smv = short.MaxValue;
-            O_Rotation_Q = new Quaternion(O_RotationX / smv, O_RotationY / smv, O_RotationZ / smv, O_RotationW / smv);
+            O_Rotation_Q = (new Quaternion(O_RotationX / smv, O_RotationY / smv, O_RotationZ / smv, O_RotationW / smv));
 
             //rotate Acceleration by the difference in rotation of vehicle between last and this update to make it match the angle for the next update better
             Quaternion PlaneRotDif = O_Rotation_Q * Quaternion.Inverse(O_LastRotation);
@@ -513,19 +500,21 @@ namespace SaccFlightAndVehicles
 
             //if direction of acceleration changed by more than 90 degrees, just set zero to prevent bounce effect, the vehicle likely just crashed into a wall.
             //+ if idlemode, disable acceleration because it brakes
-            if (Vector3.Dot(Acceleration, LastAcceleration) < 0 || SetVelZero || L_CurVel.magnitude < IdleMovementRange)
+            if (Vector3.Dot(Acceleration, LastAcceleration) < 0 || SetVelZero || O_CurVel.magnitude < IdleMovementRange)
             { Acceleration = Vector3.zero; CurAngMomAcceleration = Quaternion.identity; }
 
             RotationExtrapolationDirection = CurAngMomAcceleration * CurAngMom;
             Quaternion PingRotExtrap = RealSlerp(Quaternion.identity, RotationExtrapolationDirection, Ping);
-            Quaternion L_PingAdjustedRotation = PingRotExtrap * O_Rotation_Q;
-            RotExtrapolation_Raw = L_PingAdjustedRotation;
+            L_PingAdjustedRotation = PingRotExtrap * O_Rotation_Q;
+            Quaternion FrameRotExtrap = RealSlerp(Quaternion.identity, RotationExtrapolationDirection, -Time.deltaTime);
+            RotExtrapolation_Raw = FrameRotExtrap * L_PingAdjustedRotation;//undo 1 frame worth of movement because its done again in update()
 
             //tell the SaccAirVehicle the velocity value because it doesn't sync it itself
             if (!ObjectMode) { SAVControl.SetProgramVariable("CurrentVel", L_CurVel); }
             ExtrapolationDirection = L_CurVel + Acceleration;
+            L_PingAdjustedPosition = O_Position + (ExtrapolationDirection * Ping);
 
-            // Extrapolation_Raw = L_PingAdjustedPosition - (ExtrapolationDirection * Time.deltaTime);//undo 1 frame worth of movement because its done again in update()
+            Extrapolation_Raw = L_PingAdjustedPosition - (ExtrapolationDirection * Time.deltaTime);//undo 1 frame worth of movement because its done again in update()
 
             //if we're going one way but moved the other, we must have teleported.
             //set values to the same thing for Current and Last to make teleportation instead of interpolation
@@ -602,10 +591,6 @@ namespace SaccFlightAndVehicles
                 VehicleRigid.collisionDetectionMode = CollisionDetectionMode.Discrete;
             }
         }
-        private bool DisableAntiWarp;
-        public void SFEXT_L_FinishRace() { DisableAntiWarp = false; }
-        public void SFEXT_L_StartRace() { DisableAntiWarp = true; }
-        public void SFEXT_L_CancelRace() { DisableAntiWarp = false; }
         //unity slerp always uses shortest route to orientation rather than slerping to the actual quat. This undoes that
         public Quaternion RealSlerp(Quaternion p, Quaternion q, float t)
         {
